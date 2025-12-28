@@ -130,34 +130,50 @@ def process_itrv(result: AnalyzeResult) -> IdentityResponse:
     )
 
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 Strategy")
+    print("DEBUG: Using Form 16 Strategy V11")
     content = result.content or ""
     
-    # 1. Employer Name
-    emp_match = re.search(r"Name\s*and\s*address\s*of\s*the\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
-    if not emp_match:
-        # Fallback for some layouts like the one uploaded
-        emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+    # 1. Employer Name (The "Sandwich" Strategy)
+    # We look for text BETWEEN "Name and address of the Employer..." AND "Name and address of the Employee..."
+    employer = None
+    emp_start = re.search(r"Name\s*and\s*address\s*of\s*the\s*Employer/?(?:Specified\s*Bank)?", content, re.IGNORECASE)
+    emp_end = re.search(r"Name\s*and\s*address\s*of\s*the\s*Employee", content, re.IGNORECASE)
     
-    employer = emp_match.group(1).strip() if emp_match else None
-    if employer and len(employer) > 50: employer = employer.split("\n")[0]
+    if emp_start and emp_end:
+        # Grab everything between the two headers
+        raw_emp_text = content[emp_start.end():emp_end.start()]
+        # Clean up newlines and extra spaces
+        lines = [line.strip() for line in raw_emp_text.split('\n') if line.strip()]
+        # The first non-empty line usually contains the company name
+        # We join the first two lines just in case the name wraps (e.g., "STANDARD CHARTERED \n GBS")
+        if lines:
+            employer = " ".join(lines[:2]) 
 
-    # 2. Assessment Year
+    # Fallback if the "Sandwich" fails
+    if not employer:
+        emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+        employer = emp_match.group(1).strip() if emp_match else None
+
+    # 2. Assessment Year (e.g., 2024-25)
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Gross Salary (Regex hunting for large numbers near keywords)
-    salary_match = re.search(r"Gross\s*Salary[\s\S]{0,100}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    # 3. Gross Salary (Specific Phrase from Part B)
+    # Look for "Total amount of salary received from current employer" -> any characters -> Number
+    salary_match = re.search(r"Total\s*amount\s*of\s*salary\s*received\s*from\s*current\s*employer[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?)", content, re.IGNORECASE)
     gross = salary_match.group(1) if salary_match else None
 
-    # 4. Tax Payable
-    tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,100}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    # 4. Tax Payable (Look for "Net tax payable")
+    # Using 'Net tax payable' as per your document, or fallback to 'Total Tax Payable'
+    tax_match = re.search(r"Net\s*tax\s*payable[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?)", content, re.IGNORECASE)
+    if not tax_match:
+        tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?)", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
     warnings = []
     if not gross: warnings.append("Gross Salary not found")
+    if not employer: warnings.append("Employer Name not found")
     
-    # NOTE: We don't pass date_of_birth here, and now Pydantic won't crash because it defaults to None
     return IdentityResponse(
         document_type="FORM_16",
         employer_name=employer,
