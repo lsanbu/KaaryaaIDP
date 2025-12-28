@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+azure-ai-formrecognizer
+pydantic
+python-multipart
+python-dotenv
