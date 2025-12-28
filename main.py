@@ -14,6 +14,13 @@ import uvicorn
 load_dotenv()
 app = FastAPI(title="KDxAI - Intelligent Identity Engine")
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Kaaryaa IDP Engine is Online", 
+        "info": "Visit /docs to test the API interactively."
+    }
+
 ENDPOINT = os.getenv("AZURE_DOC_INTEL_ENDPOINT")
 KEY = os.getenv("AZURE_DOC_INTEL_KEY")
 
