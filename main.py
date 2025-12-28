@@ -14,13 +14,6 @@ import uvicorn
 load_dotenv()
 app = FastAPI(title="KDxAI - Intelligent Identity Engine")
 
-@app.get("/")
-async def root():
-    return {
-        "message": "Kaaryaa IDP Engine is Online", 
-        "info": "Visit /docs to test the API interactively."
-    }
-
 ENDPOINT = os.getenv("AZURE_DOC_INTEL_ENDPOINT")
 KEY = os.getenv("AZURE_DOC_INTEL_KEY")
 
@@ -29,23 +22,32 @@ class DocType(str, Enum):
     AUTO = "auto"
     PAN = "pan"
     AADHAAR = "aadhaar"
-    CHEQUE = "cheque"  # NEW
+    CHEQUE = "cheque"
+    FORM16 = "form16"  # NEW
+    ITRV = "itrv"      # NEW
 
 class IdentityResponse(BaseModel):
     document_type: str
-    id_number: str | None          # PAN / Aadhaar / Account Number
-    full_name: str | None          # Name / Account Holder Name
+    id_number: str | None          
+    full_name: str | None          
     gender: str | None = None
-    date_of_birth: str | None      # DOB (IDs) or Date (Cheque)
+    date_of_birth: str | None      
     address: str | None = None
-    ifsc_code: str | None = None   # NEW: Cheque Specific
-    micr_code: str | None = None   # NEW: Cheque Specific
-    bank_name: str | None = None   # NEW: Cheque Specific
+    # Banking Fields
+    ifsc_code: str | None = None   
+    micr_code: str | None = None   
+    bank_name: str | None = None   
+    # Income Fields (NEW)
+    employer_name: str | None = None
+    assessment_year: str | None = None
+    gross_income: str | None = None
+    tax_paid: str | None = None
+    
     confidence_score: float
     validation_status: str
     warnings: List[str] = []
 
-# --- SRE HELPERS ---
+# --- GENERAL HELPERS ---
 def extract_gender_fallback(full_text: str) -> Optional[str]:
     match = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", full_text, re.IGNORECASE)
     if match: return match.group(1).upper()
@@ -61,194 +63,231 @@ def extract_address_fallback(full_text: str) -> Optional[str]:
             clean_addr = re.sub(r"Print Date\s*[:\-]?\s*\d{2}/\d{2}/\d{4},?", "", raw_addr, flags=re.IGNORECASE)
             clean_addr = re.sub(r"^[:\-\s]+", "", clean_addr)
             clean_addr = re.sub(r'\s+', ' ', clean_addr).strip()
-            clean_addr = clean_addr.strip(",")
             return f"{clean_addr}, {pincode}"
     except Exception: pass
     return None
-
-def is_english(text: str) -> bool:
-    try:
-        ascii_chars = len([c for c in text if ord(c) < 128])
-        return ascii_chars / len(text) > 0.5
-    except: return False
 
 def refine_name_using_anchor(result: AnalyzeResult, partial_name: str) -> str:
     all_lines = []
     for page in result.pages:
         all_lines.extend([line.content for line in page.lines])
-
-    dob_index = -1
+    
     for i, line in enumerate(all_lines):
-        if "DOB" in line or "Year of Birth" in line or "Born" in line:
-            dob_index = i
-            break
-            
-    if dob_index > 0:
-        candidate_line = all_lines[dob_index - 1].strip()
-        if not is_english(candidate_line):
-             candidate_line = all_lines[dob_index - 2].strip()
-        if partial_name and partial_name.lower() in candidate_line.lower():
-            return candidate_line
+        if "DOB" in line or "Year of Birth" in line:
+            candidate = all_lines[i-1].strip()
+            if partial_name.lower() in candidate.lower():
+                return candidate
     return partial_name
 
-# --- CHEQUE SPECIFIC HELPERS ---
+# --- CHEQUE HELPERS ---
 def extract_ifsc(text: str) -> Optional[str]:
-    # Regex: 4 chars, '0', 6 alphanum (e.g. SBIN0123456)
     match = re.search(r"[A-Z]{4}0[A-Z0-9]{6}", text)
     return match.group(0) if match else None
 
-def extract_micr(text: str) -> Optional[str]:
-    # Regex: 9 digits, usually surrounded by special chars or at bottom
-    # We look for 9 digits that are NOT part of a longer number sequence
-    matches = re.findall(r"(?<!\d)\d{9}(?!\d)", text)
-    # Filter: MICR usually starts with 1-9 (zip code based)
-    for m in matches:
-        if m[0] != '0': return m
-    return matches[0] if matches else None
-
 def extract_account_number(text: str) -> Optional[str]:
-    # Strategy 1: Look for "A/c No" label
     match = re.search(r"(?:A/c|Account|Acc)\s*(?:No|Number)?\.?\s*[:\-]?\s*(\d{9,18})", text, re.IGNORECASE)
     if match: return match.group(1)
-    
-    # Strategy 2: Fallback - Find longest number sequence (10-18 digits) common in India
-    # Excluding numbers starting with dates like 202...
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
-    if long_numbers:
-        return max(long_numbers, key=len) # Return longest
-    return None
+    return max(long_numbers, key=len) if long_numbers else None
 
-# --- PROCESSORS ---
-def process_cheque(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using CHEQUE Strategy")
-    content = result.content
+# --- INCOME HELPERS (NEW) ---
+def clean_currency(value: str) -> str:
+    """Removes 'Rs.', spaces, and commas to standardize amounts"""
+    if not value: return None
+    return re.sub(r"[^\d\.]", "", value)
+
+def process_itrv(result: AnalyzeResult) -> IdentityResponse:
+    print("DEBUG: Using ITR-V Strategy")
+    content = result.content or ""
     
-    # 1. Hunt for Numbers
-    ifsc = extract_ifsc(content)
-    micr = extract_micr(content)
-    acc_no = extract_account_number(content)
+    # 1. Assessment Year (e.g., 2023-24)
+    ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
+    ay = ay_match.group(1) if ay_match else None
+
+    # 2. Gross Total Income
+    # Look for "Gross Total Income" followed by number
+    income_match = re.search(r"Gross\s*Total\s*Income[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    income = income_match.group(1) if income_match else None
     
-    # 2. Hunt for Bank Name (Simple heuristic based on IFSC or keywords)
-    bank_name = "Unknown Bank"
-    if ifsc:
-        # Map first 4 chars to Bank Name (Top 5 banks for demo)
-        prefix = ifsc[:4]
-        banks = {"SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank", "UTIB": "Axis Bank", "CNRB": "Canara Bank"}
-        bank_name = banks.get(prefix, f"Bank ({prefix})")
+    # 3. Tax Payable / Refund
+    tax_match = re.search(r"(?:Total\s*Tax\s*Payable|Refund)\s*[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    tax = tax_match.group(1) if tax_match else None
+
+    # 4. PAN Extraction (Fallback if Azure fields miss it)
+    pan_match = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", content)
+    pan = pan_match.group(0) if pan_match else None
     
-    # 3. Validation
+    # 5. Name (Usually top line or near PAN)
+    # Using simple heuristic: Line with Name
+    name_match = re.search(r"Name[:\s]*([A-Z\s\.]+)", content)
+    name = name_match.group(1).strip() if name_match else None
+
     warnings = []
-    if not ifsc: warnings.append("IFSC Missing")
-    if not acc_no: warnings.append("Account Number Missing")
-    
+    if not income: warnings.append("Gross Income not found")
+    if not ay: warnings.append("Assessment Year not found")
+
     return IdentityResponse(
-        document_type="CHEQUE",
-        id_number=acc_no,
-        full_name=None, # Name on cheque is too hard for basic OCR without positional logic
-        ifsc_code=ifsc,
-        micr_code=micr,
-        bank_name=bank_name,
-        date_of_birth=None, # Or extract Cheque Date if needed
-        confidence_score=0.85, # Heuristic confidence
+        document_type="ITR-V",
+        id_number=pan,
+        full_name=name,
+        assessment_year=ay,
+        gross_income=income,
+        tax_paid=tax,
+        confidence_score=0.9,
         validation_status="VALID" if not warnings else "REVIEW_NEEDED",
         warnings=warnings
     )
 
-def process_pan(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using PAN Strategy")
-    if not result.documents:
-        return IdentityResponse(document_type="UNKNOWN", id_number=None, full_name=None, confidence_score=0.0, validation_status="INVALID", warnings=["No ID detected"])
-    doc = result.documents[0]
-    fields = doc.fields
-    id_num = fields.get("DocumentNumber").value if fields.get("DocumentNumber") else None
+def process_form16(result: AnalyzeResult) -> IdentityResponse:
+    print("DEBUG: Using Form 16 Strategy")
+    content = result.content or ""
     
-    first = fields.get("FirstName").value if fields.get("FirstName") else ""
-    middle = fields.get("MiddleName").value if fields.get("MiddleName") else ""
-    last = fields.get("LastName").value if fields.get("LastName") else ""
-    full_name = f"{first} {middle} {last}".strip()
-    full_name = re.sub(r'\s+', ' ', full_name)
+    # 1. Employer Name
+    # Usually under "Name and address of Employer"
+    emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+    employer = emp_match.group(1).strip() if emp_match else None
+    if employer and len(employer) > 50: employer = employer.split("\n")[0] # Safety clip
+
+    # 2. Assessment Year
+    ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
+    ay = ay_match.group(1) if ay_match else None
+
+    # 3. Gross Salary (Part B usually)
+    # Regex looks for "Gross Salary" then grabs the last number in that line or next line
+    # This is tricky in regex, simplistic approach:
+    salary_match = re.search(r"Gross\s*Salary[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    gross = salary_match.group(1) if salary_match else None
+
+    # 4. Tax Payable
+    tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    tax = tax_match.group(1) if tax_match else None
     
-    dob = str(fields.get("DateOfBirth").value) if fields.get("DateOfBirth") else None
-    gender = extract_gender_fallback(result.content)
     warnings = []
-    if not id_num: warnings.append("PAN Missing")
-    elif not re.match(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", id_num): warnings.append("Invalid PAN Pattern")
+    if not gross: warnings.append("Gross Salary not found")
+    
+    return IdentityResponse(
+        document_type="FORM_16",
+        id_number=None, # PAN is usually there but hard to isolate from Deductor PAN without layout analysis
+        full_name=None,
+        employer_name=employer,
+        assessment_year=ay,
+        gross_income=gross,
+        tax_paid=tax,
+        confidence_score=0.85,
+        validation_status="VALID" if not warnings else "REVIEW_NEEDED",
+        warnings=warnings
+    )
 
-    return IdentityResponse(document_type="PAN_CARD", id_number=id_num, full_name=full_name, gender=gender, date_of_birth=dob, confidence_score=doc.confidence, validation_status="VALID" if not warnings else "INVALID", warnings=warnings)
-
+# --- ID PROCESSORS ---
 def process_aadhaar(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using AADHAAR Strategy")
     merged = {"id": None, "name": None, "dob": None, "address": None, "conf": []}
     for doc in result.documents:
         fields = doc.fields
         if fields.get("DocumentNumber") and not merged["id"]: merged["id"] = fields.get("DocumentNumber").value
         if not merged["name"]:
-            first = fields.get("FirstName").value if fields.get("FirstName") else ""
-            last = fields.get("LastName").value if fields.get("LastName") else ""
-            combined = f"{first} {last}".strip()
-            if combined: merged["name"] = combined
+            f = fields.get("FirstName").value if fields.get("FirstName") else ""
+            l = fields.get("LastName").value if fields.get("LastName") else ""
+            merged["name"] = f"{f} {l}".strip()
         if fields.get("Address") and not merged["address"]: merged["address"] = fields.get("Address").value
         if fields.get("DateOfBirth") and not merged["dob"]: merged["dob"] = str(fields.get("DateOfBirth").value)
         merged["conf"].append(doc.confidence)
-
+    
     if merged["name"]:
         refined = refine_name_using_anchor(result, merged["name"])
-        clean_refined = re.sub(r"(Name|Father's Name|Husband's Name)[:\-\s]*", "", refined, flags=re.IGNORECASE).strip()
-        merged["name"] = clean_refined
+        merged["name"] = re.sub(r"(Name|Father's Name)[:\-\s]*", "", refined, flags=re.IGNORECASE).strip()
 
     if not merged["address"]:
         addr = extract_address_fallback(result.content)
         if addr: merged["address"] = addr
 
-    gender = extract_gender_fallback(result.content)
     warnings = []
-    if merged["id"]:
-        uid = merged["id"].replace(" ", "")
-        if len(uid) != 12: warnings.append("Invalid Aadhaar Length")
+    if merged["id"] and len(merged["id"].replace(" ","")) != 12: warnings.append("Invalid Aadhaar Length")
     
-    avg_conf = sum(merged["conf"]) / len(merged["conf"]) if merged["conf"] else 0.0
+    return IdentityResponse(document_type="AADHAAR", id_number=merged["id"], full_name=merged["name"], gender=extract_gender_fallback(result.content), date_of_birth=merged["dob"], address=merged["address"], confidence_score=0.8, validation_status="VALID" if not warnings else "REVIEW_NEEDED", warnings=warnings)
 
-    return IdentityResponse(document_type="AADHAAR", id_number=merged["id"], full_name=merged["name"], gender=gender, date_of_birth=merged["dob"], address=merged["address"], confidence_score=avg_conf, validation_status="VALID" if not warnings else "REVIEW_NEEDED", warnings=warnings)
+def process_pan(result: AnalyzeResult) -> IdentityResponse:
+    if not result.documents: return IdentityResponse(document_type="UNKNOWN", id_number=None, full_name=None, confidence_score=0, validation_status="INVALID")
+    doc = result.documents[0]
+    fields = doc.fields
+    id_num = fields.get("DocumentNumber").value if fields.get("DocumentNumber") else None
+    f = fields.get("FirstName").value if fields.get("FirstName") else ""
+    l = fields.get("LastName").value if fields.get("LastName") else ""
+    
+    warnings = []
+    if not id_num: warnings.append("PAN Missing")
+    
+    return IdentityResponse(document_type="PAN_CARD", id_number=id_num, full_name=f"{f} {l}".strip(), gender=extract_gender_fallback(result.content), date_of_birth=str(fields.get("DateOfBirth").value) if fields.get("DateOfBirth") else None, confidence_score=doc.confidence, validation_status="VALID" if not warnings else "INVALID", warnings=warnings)
 
+def process_cheque(result: AnalyzeResult) -> IdentityResponse:
+    content = result.content
+    ifsc = extract_ifsc(content)
+    acc = extract_account_number(content)
+    warnings = []
+    if not ifsc: warnings.append("IFSC Missing")
+    if not acc: warnings.append("Account Number Missing")
+    
+    return IdentityResponse(document_type="CHEQUE", id_number=acc, full_name=None, ifsc_code=ifsc, micr_code=None, bank_name="Unknown Bank", confidence_score=0.85, validation_status="VALID" if not warnings else "REVIEW_NEEDED", warnings=warnings)
+
+# --- CLASSIFIER ---
 def classify_document(result: AnalyzeResult) -> DocType:
-    all_content = (result.content or "").upper()
-    print(f"DEBUG: Content Sample: {all_content[:100]}...")
+    content = (result.content or "").upper()
     
-    # Cheque Keywords
-    if "IFSC" in all_content or "PAY " in all_content or "RUPEES" in all_content or "A/C NO" in all_content:
-        # Strong signal: IFSC regex match
-        if re.search(r"[A-Z]{4}0[A-Z0-9]{6}", all_content):
-            return DocType.CHEQUE
+    # 1. Income Docs
+    if "FORM 16" in content or "FORM NO. 16" in content:
+        return DocType.FORM16
+    if "ITR-V" in content or "INDIAN INCOME TAX RETURN" in content:
+        return DocType.ITRV
+        
+    # 2. Cheque
+    if "PAY " in content and "RUPEES" in content:
+        if re.search(r"[A-Z]{4}0[A-Z0-9]{6}", content): return DocType.CHEQUE
 
-    if "INCOME TAX" in all_content or "PERMANENT ACCOUNT" in all_content: return DocType.PAN
-    if "UNIQUE IDENTIFICATION" in all_content or "AADHAAR" in all_content: return DocType.AADHAAR
+    # 3. IDs
+    if "INCOME TAX DEPARTMENT" in content: return DocType.PAN
+    if "UNIQUE IDENTIFICATION" in content or "AADHAAR" in content: return DocType.AADHAAR
     
-    return DocType.PAN
+    return DocType.PAN # Default fallback
 
+# --- ROUTER ---
 @app.post("/extract/identity", response_model=IdentityResponse)
 async def extract_identity(file: UploadFile = File(...), doc_type: DocType = Form(DocType.AUTO)):
     if not KEY or not ENDPOINT: raise HTTPException(500, "Missing Keys")
     await file.seek(0)
     content = await file.read()
-    try:
-        client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
-        # Use 'prebuilt-read' if we suspect a cheque (better for raw text), but 'prebuilt-idDocument' handles IDs better.
-        # For this hybrid engine, 'prebuilt-idDocument' is okay, but if cheque fails, we might need 'prebuilt-read'.
-        # Let's stick to prebuilt-idDocument for now as it also does OCR.
-        poller = client.begin_analyze_document("prebuilt-idDocument", document=content)
-        result = poller.result()
-        
-        strategy = doc_type
-        if strategy == DocType.AUTO: strategy = classify_document(result)
-        
-        print(f"DEBUG: Selected Strategy: {strategy}")
+    
+    client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
+    # Using prebuilt-layout for Income docs (better table support)
+    # Using prebuilt-idDocument for IDs
+    # For simplicity in this V9, we use prebuilt-document (general) or prebuilt-idDocument.
+    # IDs need 'prebuilt-idDocument'. Forms need 'prebuilt-layout'.
+    # We will try 'prebuilt-layout' as it can read text well for everything, 
+    # BUT 'prebuilt-idDocument' has special fields for IDs.
+    
+    # STRATEGY: We sniff content first? No, we need to pick model before analyzing.
+    # HYBRID APPROACH: Use 'prebuilt-layout' for everything? 
+    # No, 'prebuilt-idDocument' is too good for Aadhaar to give up.
+    # Let's default to 'prebuilt-idDocument' first. If it looks like a Form 16, we might re-scan?
+    # To save credits/time, let's stick to ONE model: 'prebuilt-idDocument' actually extracts all text too!
+    # So we can use Regex on the .content result from idDocument.
+    
+    poller = client.begin_analyze_document("prebuilt-idDocument", document=content)
+    result = poller.result()
+    
+    strategy = doc_type
+    if strategy == DocType.AUTO: strategy = classify_document(result)
+    
+    print(f"DEBUG: Classified as {strategy}")
 
-        if strategy == DocType.AADHAAR: return process_aadhaar(result)
-        elif strategy == DocType.CHEQUE: return process_cheque(result)
-        else: return process_pan(result)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Error: {str(e)}")
+    if strategy == DocType.AADHAAR: return process_aadhaar(result)
+    elif strategy == DocType.PAN: return process_pan(result)
+    elif strategy == DocType.CHEQUE: return process_cheque(result)
+    elif strategy == DocType.FORM16: return process_form16(result)
+    elif strategy == DocType.ITRV: return process_itrv(result)
+    else: return process_pan(result)
+
+@app.get("/")
+async def root():
+    return {"message": "Kaaryaa IDP Engine Online", "endpoints": "/extract/identity"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

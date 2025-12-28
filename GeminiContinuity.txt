@@ -1,0 +1,31 @@
+# CONTEXT RELOAD: KAARYA IDP & ANBU'S PROFILE
+
+**User Persona:** Anbu Chezhian S.
+**Background:** AVP Technology Operations & SRE (25+ years exp) at Standard Chartered/Citi.
+**Current Pivot:** Moving from pure Ops/GRC to "AI Automation Architect" & "Applied Engineering".
+**Key Project:** Kaaryaa DigitalX (KDxAI) - An Intelligent Document Processing (IDP) Engine.
+
+**The Tech Stack:**
+* **Language:** Python (FastAPI, Pydantic, Uvicorn).
+* **AI Engine:** Azure Document Intelligence (SDK).
+* **Deployment:** Render (Cloud), Docker-ready.
+* **Repo:** https://github.com/lsanbu/KaaryaaIDP
+
+**Current Code Logic (main.py):**
+1.  **Identity Response Model:** Extracts `id_number`, `full_name`, `dob`, `address`, `ifsc`, `micr`, `warnings`.
+2.  **Routing:** Auto-classifies document types (Aadhaar vs. PAN vs. Cheque).
+3.  **Aadhaar Strategy:** Uses "Anchor Logic" (Finds 'DOB' line, looks at the line above for Name) to fix OCR fragmentation. Includes "Consent Evidence" extraction.
+4.  **PAN Strategy:** Regex validation for PAN pattern.
+5.  **Cheque Strategy:** "Hunter-Seeker" Regex to find IFSC/Account Numbers in unstructured layouts (CTS-2010).
+6.  **SRE Features:** Includes `validation_status`, `confidence_score`, and fallback logic (Human-in-the-loop triggers).
+
+**Strategic Roadmap (To-Do):**
+1.  **Income Module:** Add support for Form 16 and ITR-V using `prebuilt-layout` (Table Extraction logic).
+2.  **Bank Statements:** Implement "Mathematical Integrity Check" (Opening + Credits - Debits == Closing) to detect PDF forgery.
+3.  **UI:** Build a simple Streamlit/Lovable UI for "Maker/Checker" workflow.
+
+**The Goal:**
+Build an "Audit-Ready" AI solution for Indian BFSI that focuses on Reliability, Traceability, and Evidence (not just extraction).
+
+**Next Request:**
+[Insert your question here, e.g., "Let's start coding the Form 16 logic..."]
