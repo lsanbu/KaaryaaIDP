@@ -130,44 +130,57 @@ def process_itrv(result: AnalyzeResult) -> IdentityResponse:
     )
 
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 Strategy V11")
+    print("DEBUG: Using Form 16 Strategy V12")
     content = result.content or ""
     
-    # 1. Employer Name (The "Sandwich" Strategy)
-    # We look for text BETWEEN "Name and address of the Employer..." AND "Name and address of the Employee..."
+    # 1. Employer Name (Relaxed "Sandwich" Strategy)
+    # Made 'the' optional: Name and address of (the) Employer
+    # Made 'Specified Bank' optional
     employer = None
-    emp_start = re.search(r"Name\s*and\s*address\s*of\s*the\s*Employer/?(?:Specified\s*Bank)?", content, re.IGNORECASE)
-    emp_end = re.search(r"Name\s*and\s*address\s*of\s*the\s*Employee", content, re.IGNORECASE)
+    # Look for start marker (Case Insensitive)
+    emp_start = re.search(r"Name\s*and\s*address\s*of\s*(?:the\s*)?Employer", content, re.IGNORECASE)
+    # Look for end marker (Case Insensitive)
+    emp_end = re.search(r"Name\s*and\s*address\s*of\s*(?:the\s*)?Employee", content, re.IGNORECASE)
     
     if emp_start and emp_end:
-        # Grab everything between the two headers
+        # Extract text between markers
         raw_emp_text = content[emp_start.end():emp_end.start()]
-        # Clean up newlines and extra spaces
-        lines = [line.strip() for line in raw_emp_text.split('\n') if line.strip()]
-        # The first non-empty line usually contains the company name
-        # We join the first two lines just in case the name wraps (e.g., "STANDARD CHARTERED \n GBS")
-        if lines:
-            employer = " ".join(lines[:2]) 
-
-    # Fallback if the "Sandwich" fails
+        # Filter out empty lines or small noise
+        lines = [line.strip() for line in raw_emp_text.split('\n') if len(line.strip()) > 3]
+        
+        # Heuristic: The Employer name is usually the first ALL CAPS or Title Case line
+        for line in lines:
+            # Skip lines that look like addresses (contain digits/pincodes) early on if possible, 
+            # but usually the Name is first.
+            employer = line
+            break # Take the first valid line
+            
+    # Fallback: Look for "TAN of Employer" and look backwards (Advanced) or use original fallback
     if not employer:
+        # Try finding standard line
         emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
         employer = emp_match.group(1).strip() if emp_match else None
 
-    # 2. Assessment Year (e.g., 2024-25)
+    # 2. Assessment Year (Broad Search)
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Gross Salary (Specific Phrase from Part B)
-    # Look for "Total amount of salary received from current employer" -> any characters -> Number
-    salary_match = re.search(r"Total\s*amount\s*of\s*salary\s*received\s*from\s*current\s*employer[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?)", content, re.IGNORECASE)
+    # 3. Gross Salary (Robust Regex)
+    # Increased search window {0,300} chars to skip over "[1(d)-2(i)]" etc.
+    # Improved Number Regex: (\d[\d,]*\.\d{2}) -> Digit, followed by any digits/commas, ending in .00
+    salary_match = re.search(
+        r"Total\s*amount\s*of\s*salary\s*received\s*from\s*current\s*employer[\s\S]{0,300}?(\d[\d,]*\.\d{2})", 
+        content, 
+        re.IGNORECASE
+    )
     gross = salary_match.group(1) if salary_match else None
 
-    # 4. Tax Payable (Look for "Net tax payable")
-    # Using 'Net tax payable' as per your document, or fallback to 'Total Tax Payable'
-    tax_match = re.search(r"Net\s*tax\s*payable[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?)", content, re.IGNORECASE)
+    # 4. Tax Payable (Robust Regex)
+    # Look for 'Net tax payable' OR 'Total Tax Payable'
+    # Scans up to 300 chars to find the number
+    tax_match = re.search(r"Net\s*tax\s*payable[\s\S]{0,300}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
     if not tax_match:
-        tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?)", content, re.IGNORECASE)
+        tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,300}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
     warnings = []
