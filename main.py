@@ -17,27 +17,30 @@ app = FastAPI(title="KDxAI - Intelligent Identity Engine")
 ENDPOINT = os.getenv("AZURE_DOC_INTEL_ENDPOINT")
 KEY = os.getenv("AZURE_DOC_INTEL_KEY")
 
-# --- DATA MODELS ---
+# --- DATA MODELS (FIXED) ---
 class DocType(str, Enum):
     AUTO = "auto"
     PAN = "pan"
     AADHAAR = "aadhaar"
     CHEQUE = "cheque"
-    FORM16 = "form16"  # NEW
-    ITRV = "itrv"      # NEW
+    FORM16 = "form16"
+    ITRV = "itrv"
 
 class IdentityResponse(BaseModel):
     document_type: str
-    id_number: str | None          
-    full_name: str | None          
+    # We add '= None' to all optional fields so Pydantic doesn't crash if we skip them
+    id_number: str | None = None
+    full_name: str | None = None
     gender: str | None = None
-    date_of_birth: str | None      
+    date_of_birth: str | None = None  # <--- FIXED: Now defaults to None
     address: str | None = None
+    
     # Banking Fields
     ifsc_code: str | None = None   
     micr_code: str | None = None   
     bank_name: str | None = None   
-    # Income Fields (NEW)
+    
+    # Income Fields
     employer_name: str | None = None
     assessment_year: str | None = None
     gross_income: str | None = None
@@ -90,35 +93,23 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME HELPERS (NEW) ---
-def clean_currency(value: str) -> str:
-    """Removes 'Rs.', spaces, and commas to standardize amounts"""
-    if not value: return None
-    return re.sub(r"[^\d\.]", "", value)
-
+# --- INCOME HELPERS ---
 def process_itrv(result: AnalyzeResult) -> IdentityResponse:
     print("DEBUG: Using ITR-V Strategy")
     content = result.content or ""
     
-    # 1. Assessment Year (e.g., 2023-24)
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 2. Gross Total Income
-    # Look for "Gross Total Income" followed by number
     income_match = re.search(r"Gross\s*Total\s*Income[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
     income = income_match.group(1) if income_match else None
     
-    # 3. Tax Payable / Refund
     tax_match = re.search(r"(?:Total\s*Tax\s*Payable|Refund)\s*[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
 
-    # 4. PAN Extraction (Fallback if Azure fields miss it)
     pan_match = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", content)
     pan = pan_match.group(0) if pan_match else None
     
-    # 5. Name (Usually top line or near PAN)
-    # Using simple heuristic: Line with Name
     name_match = re.search(r"Name[:\s]*([A-Z\s\.]+)", content)
     name = name_match.group(1).strip() if name_match else None
 
@@ -143,32 +134,32 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     content = result.content or ""
     
     # 1. Employer Name
-    # Usually under "Name and address of Employer"
-    emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+    emp_match = re.search(r"Name\s*and\s*address\s*of\s*the\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+    if not emp_match:
+        # Fallback for some layouts like the one uploaded
+        emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+    
     employer = emp_match.group(1).strip() if emp_match else None
-    if employer and len(employer) > 50: employer = employer.split("\n")[0] # Safety clip
+    if employer and len(employer) > 50: employer = employer.split("\n")[0]
 
     # 2. Assessment Year
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Gross Salary (Part B usually)
-    # Regex looks for "Gross Salary" then grabs the last number in that line or next line
-    # This is tricky in regex, simplistic approach:
-    salary_match = re.search(r"Gross\s*Salary[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    # 3. Gross Salary (Regex hunting for large numbers near keywords)
+    salary_match = re.search(r"Gross\s*Salary[\s\S]{0,100}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
     gross = salary_match.group(1) if salary_match else None
 
     # 4. Tax Payable
-    tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,50}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,100}?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
     warnings = []
     if not gross: warnings.append("Gross Salary not found")
     
+    # NOTE: We don't pass date_of_birth here, and now Pydantic won't crash because it defaults to None
     return IdentityResponse(
         document_type="FORM_16",
-        id_number=None, # PAN is usually there but hard to isolate from Deductor PAN without layout analysis
-        full_name=None,
         employer_name=employer,
         assessment_year=ay,
         gross_income=gross,
@@ -232,21 +223,13 @@ def process_cheque(result: AnalyzeResult) -> IdentityResponse:
 def classify_document(result: AnalyzeResult) -> DocType:
     content = (result.content or "").upper()
     
-    # 1. Income Docs
-    if "FORM 16" in content or "FORM NO. 16" in content:
-        return DocType.FORM16
-    if "ITR-V" in content or "INDIAN INCOME TAX RETURN" in content:
-        return DocType.ITRV
-        
-    # 2. Cheque
-    if "PAY " in content and "RUPEES" in content:
-        if re.search(r"[A-Z]{4}0[A-Z0-9]{6}", content): return DocType.CHEQUE
-
-    # 3. IDs
+    if "FORM 16" in content or "FORM NO. 16" in content: return DocType.FORM16
+    if "ITR-V" in content or "INDIAN INCOME TAX RETURN" in content: return DocType.ITRV
+    if "PAY " in content and "RUPEES" in content and re.search(r"[A-Z]{4}0[A-Z0-9]{6}", content): return DocType.CHEQUE
     if "INCOME TAX DEPARTMENT" in content: return DocType.PAN
     if "UNIQUE IDENTIFICATION" in content or "AADHAAR" in content: return DocType.AADHAAR
     
-    return DocType.PAN # Default fallback
+    return DocType.PAN 
 
 # --- ROUTER ---
 @app.post("/extract/identity", response_model=IdentityResponse)
@@ -256,26 +239,11 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     content = await file.read()
     
     client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
-    # Using prebuilt-layout for Income docs (better table support)
-    # Using prebuilt-idDocument for IDs
-    # For simplicity in this V9, we use prebuilt-document (general) or prebuilt-idDocument.
-    # IDs need 'prebuilt-idDocument'. Forms need 'prebuilt-layout'.
-    # We will try 'prebuilt-layout' as it can read text well for everything, 
-    # BUT 'prebuilt-idDocument' has special fields for IDs.
-    
-    # STRATEGY: We sniff content first? No, we need to pick model before analyzing.
-    # HYBRID APPROACH: Use 'prebuilt-layout' for everything? 
-    # No, 'prebuilt-idDocument' is too good for Aadhaar to give up.
-    # Let's default to 'prebuilt-idDocument' first. If it looks like a Form 16, we might re-scan?
-    # To save credits/time, let's stick to ONE model: 'prebuilt-idDocument' actually extracts all text too!
-    # So we can use Regex on the .content result from idDocument.
-    
     poller = client.begin_analyze_document("prebuilt-idDocument", document=content)
     result = poller.result()
     
     strategy = doc_type
     if strategy == DocType.AUTO: strategy = classify_document(result)
-    
     print(f"DEBUG: Classified as {strategy}")
 
     if strategy == DocType.AADHAAR: return process_aadhaar(result)
@@ -287,7 +255,7 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
 
 @app.get("/")
 async def root():
-    return {"message": "Kaaryaa IDP Engine Online", "endpoints": "/extract/identity"}
+    return {"message": "Kaaryaa IDP Engine is Online", "info": "Visit /docs to test the API interactively."}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
