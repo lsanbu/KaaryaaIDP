@@ -92,26 +92,24 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME PROCESSORS (V15 - AZURE KEY-VALUE FALLBACK) ---
+# --- INCOME PROCESSORS (V16 - ROBUST INCOME HUNT) ---
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 V15 (Azure Fallback Edition)")
+    print("DEBUG: Using Form 16 V16 (Robust Income Hunt)")
     content = result.content or ""
     
-    # 1. Employer Name (Smart Line Iterator - Proven to work)
+    # 1. Employer Name (Standard Logic)
     employer = None
     lines = [line.content for page in result.pages for line in page.lines]
-    
     for i, line in enumerate(lines):
         if "Name and address of the Employer" in line or "Name and address of the Employer/Specified Bank" in line:
             for offset in range(1, 4):
                 if i + offset >= len(lines): break
                 candidate = lines[i+offset].strip()
-                if "Name and address" in candidate or "Employee" in candidate or "Specified senior" in candidate:
-                    continue
+                if "Name and address" in candidate or "Employee" in candidate: continue
                 employer = candidate
                 if i + offset + 1 < len(lines):
                     next_l = lines[i+offset+1].strip()
-                    if next_l.isupper() and ("PRIVATE" in next_l or "LIMITED" in next_l or "SERVICES" in next_l):
+                    if next_l.isupper() and ("PRIVATE" in next_l or "LIMITED" in next_l):
                         employer += " " + next_l
                 break
             break
@@ -120,61 +118,59 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Income Extraction (Multi-Layered Strategy)
+    # 3. Income Extraction (Priority: Gross -> Taxable)
     gross = None
     
-    # Priority Keywords (Added "Taxable Income" for Page 3 support)
+    # Priority 1: Check Tables for "Gross Salary" (Page 1/2) OR "Total taxable income" (Page 3/4)
     target_row_keywords = [
-        "Total amount of salary received from current employer", 
         "Gross Salary", 
-        "Total taxable income",
+        "Total amount of salary received from current employer",
+        "Total taxable income", # <--- Added for your specific page
         "Net Salary"
     ]
     
-    # STRATEGY A: TABLE LOOKUP (Best for Structured Data)
     if result.tables:
         for table in result.tables:
             for cell in table.cells:
                 cell_text = cell.content.replace("\n", " ").strip()
+                # Check if cell matches keywords
                 if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    print(f"DEBUG: Found Income Keyword in Table: '{cell_text}'")
+                    print(f"DEBUG: Found Keyword in Table: '{cell_text}'")
+                    
+                    # Get all cells in this row
                     row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
+                    
+                    # Iterate backwards (Right -> Left) to find the amount
                     for c in reversed(row_cells):
-                        val = c.content.replace("Rs.", "").replace(",", "").strip()
-                        if re.match(r"^\d+(\.\d{2})?$", val) and float(val) > 1000:
-                            gross = c.content
-                            print(f"DEBUG: Extracted via Table: {gross}")
-                            break
+                        # Clean: "Rs. 47,21,532.00" -> "4721532.00"
+                        val = re.sub(r"[^\d\.]", "", c.content) 
+                        
+                        # Match 4721532 OR 4721532.00
+                        if re.match(r"^\d+(\.\d{1,2})?$", val) and len(val) > 3:
+                            # Verify it's not a small number (like a row number '12')
+                            if float(val) > 1000:
+                                gross = c.content
+                                print(f"DEBUG: Extracted Income via Table: {gross}")
+                                break
                     if gross: break
             if gross: break
 
-    # STRATEGY B: AZURE KEY-VALUE PAIRS (The "Fallback" you asked for)
-    # prebuilt-document extracts KV pairs automatically. We search them.
-    if not gross and result.key_value_pairs:
-        print("DEBUG: Checking Azure Key-Value Pairs...")
-        for kv in result.key_value_pairs:
-            if kv.key and kv.value:
-                key_text = kv.key.content.lower()
-                # Look for keys like "Gross Salary" or "Total Income"
-                if "gross salary" in key_text or "total taxable income" in key_text:
-                    val = kv.value.content.replace(",", "").strip()
-                    if re.match(r"^\d+(\.\d{2})?$", val):
-                        gross = kv.value.content
-                        print(f"DEBUG: Extracted via Azure KV Fallback: {key_text} -> {gross}")
-                        break
-
-    # STRATEGY C: REGEX FALLBACK (Last Resort)
+    # Priority 2: Regex Hunt (If tables fail)
+    # Hunts for "Total taxable income ... 4721532.00" spanning newlines
     if not gross:
-        # Matches "Total taxable income ... 4721532.00"
-        regex_hunt = re.search(
-            r"(?:Total\s+taxable\s+income|Gross\s+Salary)[\s\S]{1,150}?(\d[\d,]*\.\d{2})", 
-            content, 
-            re.IGNORECASE
-        )
-        if regex_hunt:
-            gross = regex_hunt.group(1)
-            print(f"DEBUG: Extracted via Regex: {gross}")
+        print("DEBUG: Trying Regex Fallback...")
+        regex_patterns = [
+            r"Total\s*taxable\s*income[\s\S]{1,150}?([\d,]+\.\d{2})",
+            r"Gross\s*Salary[\s\S]{1,150}?([\d,]+\.\d{2})",
+            r"Net\s*Salary[\s\S]{1,150}?([\d,]+\.\d{2})"
+        ]
+        for pat in regex_patterns:
+            match = re.search(pat, content, re.IGNORECASE)
+            if match:
+                gross = match.group(1)
+                print(f"DEBUG: Extracted Income via Regex: {gross}")
+                break
 
     # 4. Tax Payable
     tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
@@ -265,11 +261,10 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     
     client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
     
-    # SWITCH: Use 'prebuilt-document' for Forms to get KV Pairs + Tables
-    # 'prebuilt-idDocument' for IDs
+    # REVERT: Use 'prebuilt-layout' for Forms because your JSON confirmed it works perfectly for Tables
     model_id = "prebuilt-idDocument"
     if doc_type in [DocType.FORM16, DocType.ITRV, DocType.CHEQUE]:
-        model_id = "prebuilt-document" # <--- CHANGED THIS
+        model_id = "prebuilt-layout" # <--- REVERTED to use your proven JSON logic
         
     print(f"DEBUG: Selected Model: {model_id} for DocType: {doc_type}")
     
