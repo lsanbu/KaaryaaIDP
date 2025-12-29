@@ -92,36 +92,23 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME PROCESSORS (V14 - SMART SKIP & DUAL MODE) ---
+# --- INCOME PROCESSORS (V15 - AZURE KEY-VALUE FALLBACK) ---
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 V14 Strategy")
+    print("DEBUG: Using Form 16 V15 (Azure Fallback Edition)")
     content = result.content or ""
     
-    # 1. Employer Name (Smart Line Iterator)
+    # 1. Employer Name (Smart Line Iterator - Proven to work)
     employer = None
     lines = [line.content for page in result.pages for line in page.lines]
     
     for i, line in enumerate(lines):
-        # Find the Employer Header
         if "Name and address of the Employer" in line or "Name and address of the Employer/Specified Bank" in line:
-            print(f"DEBUG: Found Employer Header at line {i}: {line}")
-            
-            # Look ahead up to 3 lines to find the actual name
-            # This skips "Name and address of Employee..." if it appears immediately after
             for offset in range(1, 4):
                 if i + offset >= len(lines): break
                 candidate = lines[i+offset].strip()
-                
-                # SKIP LOGIC: If candidate is another header, ignore it
                 if "Name and address" in candidate or "Employee" in candidate or "Specified senior" in candidate:
-                    print(f"DEBUG: Skipping header-like line: {candidate}")
                     continue
-                
-                # Found it!
                 employer = candidate
-                print(f"DEBUG: Selected Employer: {employer}")
-                
-                # Check next line for continuation (e.g. "GLOBAL BUSINESS SERVICES")
                 if i + offset + 1 < len(lines):
                     next_l = lines[i+offset+1].strip()
                     if next_l.isupper() and ("PRIVATE" in next_l or "LIMITED" in next_l or "SERVICES" in next_l):
@@ -133,59 +120,68 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Gross Salary - STRATEGY A: TABLE LOOKUP
+    # 3. Income Extraction (Multi-Layered Strategy)
     gross = None
-    # Keywords to find the right row in the table
+    
+    # Priority Keywords (Added "Taxable Income" for Page 3 support)
     target_row_keywords = [
         "Total amount of salary received from current employer", 
         "Gross Salary", 
-        "Salary as per provisions contained in section 17(1)"
+        "Total taxable income",
+        "Net Salary"
     ]
     
+    # STRATEGY A: TABLE LOOKUP (Best for Structured Data)
     if result.tables:
-        print(f"DEBUG: Scanning {len(result.tables)} tables for Gross Salary...")
         for table in result.tables:
             for cell in table.cells:
                 cell_text = cell.content.replace("\n", " ").strip()
-                
                 if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    print(f"DEBUG: Found Salary Row Keyword: '{cell_text}'")
-                    # Get all cells in this row
+                    print(f"DEBUG: Found Income Keyword in Table: '{cell_text}'")
                     row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
-                    
-                    # Iterate backwards to find the number (usually last column)
                     for c in reversed(row_cells):
                         val = c.content.replace("Rs.", "").replace(",", "").strip()
-                        # Match 12345.00 or 12345
-                        if re.match(r"^\d+(\.\d{2})?$", val) and float(val) > 1000: # Filter small row numbers
+                        if re.match(r"^\d+(\.\d{2})?$", val) and float(val) > 1000:
                             gross = c.content
-                            print(f"DEBUG: Extracted Gross via Table: {gross}")
+                            print(f"DEBUG: Extracted via Table: {gross}")
                             break
                     if gross: break
             if gross: break
 
-    # 3. Gross Salary - STRATEGY B: REGEX FALLBACK (If Table failed)
+    # STRATEGY B: AZURE KEY-VALUE PAIRS (The "Fallback" you asked for)
+    # prebuilt-document extracts KV pairs automatically. We search them.
+    if not gross and result.key_value_pairs:
+        print("DEBUG: Checking Azure Key-Value Pairs...")
+        for kv in result.key_value_pairs:
+            if kv.key and kv.value:
+                key_text = kv.key.content.lower()
+                # Look for keys like "Gross Salary" or "Total Income"
+                if "gross salary" in key_text or "total taxable income" in key_text:
+                    val = kv.value.content.replace(",", "").strip()
+                    if re.match(r"^\d+(\.\d{2})?$", val):
+                        gross = kv.value.content
+                        print(f"DEBUG: Extracted via Azure KV Fallback: {key_text} -> {gross}")
+                        break
+
+    # STRATEGY C: REGEX FALLBACK (Last Resort)
     if not gross:
-        print("DEBUG: Table extraction failed. Trying Regex Fallback...")
-        # Look for the specific pattern in Part B: "Total... [1(d)-2(i)] ... 4771532.00"
-        # We look for a large number following "Total amount of salary"
-        # [\s\S]{1,100} allows for newlines and noise like "[1(d)-2(i)]"
+        # Matches "Total taxable income ... 4721532.00"
         regex_hunt = re.search(
-            r"Total\s+amount\s+of\s+salary\s+received[\s\S]{1,150}?(\d[\d,]*\.\d{2})", 
+            r"(?:Total\s+taxable\s+income|Gross\s+Salary)[\s\S]{1,150}?(\d[\d,]*\.\d{2})", 
             content, 
             re.IGNORECASE
         )
         if regex_hunt:
             gross = regex_hunt.group(1)
-            print(f"DEBUG: Extracted Gross via Regex: {gross}")
+            print(f"DEBUG: Extracted via Regex: {gross}")
 
     # 4. Tax Payable
     tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
     warnings = []
-    if not gross: warnings.append("Gross Salary not found")
+    if not gross: warnings.append("Income info not found")
     if not employer: warnings.append("Employer Name not found")
     
     return IdentityResponse(
@@ -269,10 +265,11 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     
     client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
     
-    # SMART SWITCH: Choose model
+    # SWITCH: Use 'prebuilt-document' for Forms to get KV Pairs + Tables
+    # 'prebuilt-idDocument' for IDs
     model_id = "prebuilt-idDocument"
     if doc_type in [DocType.FORM16, DocType.ITRV, DocType.CHEQUE]:
-        model_id = "prebuilt-layout"
+        model_id = "prebuilt-document" # <--- CHANGED THIS
         
     print(f"DEBUG: Selected Model: {model_id} for DocType: {doc_type}")
     
