@@ -92,13 +92,16 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME PROCESSORS (V18 - UNIVERSAL WHITESPACE REGEX) ---
-# --- INCOME PROCESSORS (V19 - THE BULLDOZER & TABLE DUMPER) ---
+# --- INCOME PROCESSORS (V20 - X-RAY & SPACE NORMALIZATION) ---
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 V19 (Bulldozer Strategy)")
+    print("DEBUG: Using Form 16 V20 (X-Ray Strategy)")
     content = result.content or ""
     
-    # 1. Employer Name (Standard Logic - Working perfectly)
+    # 1. DEBUG: Print what Azure actually sees!
+    # This will appear in your logs and tell us if the text is garbled or empty.
+    print(f"DEBUG: Document Content Start: {content[:500].replace(chr(10), ' ')}...") 
+
+    # 2. Employer Name (Standard Logic)
     employer = None
     lines = [line.content for page in result.pages for line in page.lines]
     for i, line in enumerate(lines):
@@ -116,60 +119,59 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
                 break
             break
 
-    # 2. Assessment Year
+    # 3. Assessment Year
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Income Extraction
+    # 4. Income Extraction (Robust Table & Regex)
     gross = None
     
-    # --- STRATEGY A: THE BULLDOZER REGEX ---
-    # We look for "Total taxable income" OR "Gross Salary"
-    # [\s\S]{1,200}? matches ANY character (newlines included) up to 200 chars non-greedily.
-    # This skips over "(9-11)", spaces, newlines, and any OCR noise.
-    bulldozer_pattern = r"(?:Total\s+taxable\s+income|Gross\s+Salary|Net\s+Salary)[\s\S]{1,200}?(\d[\d,]*\.\d{2})"
-    
-    match = re.search(bulldozer_pattern, content, re.IGNORECASE)
-    if match:
-        gross = match.group(1)
-        print(f"DEBUG: Extracted via Bulldozer Regex: {gross}")
-
-    # --- STRATEGY B: TABLE LOOKUP (With Debugging) ---
-    if not gross and result.tables:
-        print(f"DEBUG: Scanning {len(result.tables)} tables for Income...")
-        target_row_keywords = ["Total taxable income", "Gross Salary", "Net Salary", "Total amount of salary"]
+    # --- STRATEGY A: TABLE LOOKUP (Normalized) ---
+    if result.tables:
+        print(f"DEBUG: Scanning {len(result.tables)} tables...")
+        # Use simpler, partial keywords to avoid whitespace mismatches
+        target_row_keywords = ["taxable income", "gross salary", "net salary", "salary received", "total amount of salary"]
         
         for t_idx, table in enumerate(result.tables):
             for cell in table.cells:
-                cell_text = cell.content.replace("\n", " ").strip()
+                # Normalize: Replace newlines/tabs with space, collapse multiple spaces to one
+                raw_text = cell.content or ""
+                clean_text = re.sub(r'\s+', ' ', raw_text).strip().lower()
                 
-                # Check if this cell is a Header/Label
-                if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    print(f"DEBUG: Table {t_idx} Found Keyword: '{cell_text}' in Row {cell.row_index}")
+                # Check for keyword match
+                if any(k in clean_text for k in target_row_keywords):
+                    print(f"DEBUG: Table {t_idx} Match: '{clean_text}' (Row {cell.row_index})")
                     
                     # Get all cells in this row
                     row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
                     
-                    # Log the row content to see what we are dealing with
-                    row_values = [c.content.replace('\n', ' ') for c in row_cells]
-                    print(f"DEBUG: Row Content: {row_values}")
-
-                    # Iterate backwards to find the amount
+                    # Iterate backwards to find the number
                     for c in reversed(row_cells):
-                        val = re.sub(r"[^\d\.]", "", c.content) # Strip 'Rs.', commas
+                        # Clean: "4,721,532.00" -> "4721532.00"
+                        val = re.sub(r"[^\d\.]", "", c.content)
                         
-                        # Match loose number format (e.g. 4721532 or 4721532.00)
+                        # Match: Digits, optional dot, optional decimals
+                        # Matches "4721532" OR "4721532.00"
                         if re.match(r"^\d+(\.\d{1,2})?$", val):
-                            # Filter out small numbers like row indices "12" or "1"
-                            if float(val) > 1000: 
+                            if float(val) > 1000: # Ignore small numbers like "12"
                                 gross = c.content
                                 print(f"DEBUG: Extracted via Table: {gross}")
                                 break
                     if gross: break
             if gross: break
 
-    # 4. Tax Payable
+    # --- STRATEGY B: BULLDOZER REGEX (Fallback) ---
+    if not gross:
+        print("DEBUG: Tables failed. Trying Bulldozer Regex...")
+        # Matches "Taxable Income" ... (up to 300 chars junk) ... Number
+        bulldozer_pattern = r"(?:taxable\s+income|gross\s+salary|net\s+salary|salary\s+received)[\s\S]{0,300}?(\d[\d,]+(?:\.\d{1,2})?)"
+        match = re.search(bulldozer_pattern, content, re.IGNORECASE)
+        if match:
+            gross = match.group(1)
+            print(f"DEBUG: Extracted via Bulldozer Regex: {gross}")
+
+    # 5. Tax Payable
     tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
