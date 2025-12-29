@@ -92,12 +92,12 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME PROCESSORS (V16 - ROBUST INCOME HUNT) ---
+# --- INCOME PROCESSORS (V17 - SNIPER REGEX) ---
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 V16 (Robust Income Hunt)")
+    print("DEBUG: Using Form 16 V17 (Sniper Regex)")
     content = result.content or ""
     
-    # 1. Employer Name (Standard Logic)
+    # 1. Employer Name
     employer = None
     lines = [line.content for page in result.pages for line in page.lines]
     for i, line in enumerate(lines):
@@ -118,59 +118,46 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Income Extraction (Priority: Gross -> Taxable)
+    # 3. Income Extraction
     gross = None
     
-    # Priority 1: Check Tables for "Gross Salary" (Page 1/2) OR "Total taxable income" (Page 3/4)
-    target_row_keywords = [
-        "Gross Salary", 
-        "Total amount of salary received from current employer",
-        "Total taxable income", # <--- Added for your specific page
-        "Net Salary"
-    ]
-    
-    if result.tables:
+    # --- STRATEGY A: THE SNIPER REGEX (Based on your JSON) ---
+    # Matches: "12." -> newline -> "Total taxable income (9-11)" -> newline -> "4721532.00"
+    # We use [\s\S] to match across newlines
+    sniper_match = re.search(
+        r"12\.\s*[\r\n]+\s*Total\s*taxable\s*income\s*\(9-11\)\s*[\r\n]+\s*(\d[\d,]*\.\d{2})", 
+        content, 
+        re.IGNORECASE
+    )
+    if sniper_match:
+        gross = sniper_match.group(1)
+        print(f"DEBUG: Extracted via Sniper Regex: {gross}")
+
+    # --- STRATEGY B: TABLE LOOKUP (Backup) ---
+    if not gross and result.tables:
+        target_row_keywords = ["Total taxable income", "Gross Salary"]
         for table in result.tables:
             for cell in table.cells:
                 cell_text = cell.content.replace("\n", " ").strip()
-                # Check if cell matches keywords
                 if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    print(f"DEBUG: Found Keyword in Table: '{cell_text}'")
-                    
-                    # Get all cells in this row
                     row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
-                    
-                    # Iterate backwards (Right -> Left) to find the amount
                     for c in reversed(row_cells):
-                        # Clean: "Rs. 47,21,532.00" -> "4721532.00"
-                        val = re.sub(r"[^\d\.]", "", c.content) 
-                        
-                        # Match 4721532 OR 4721532.00
-                        if re.match(r"^\d+(\.\d{1,2})?$", val) and len(val) > 3:
-                            # Verify it's not a small number (like a row number '12')
-                            if float(val) > 1000:
-                                gross = c.content
-                                print(f"DEBUG: Extracted Income via Table: {gross}")
-                                break
+                        val = re.sub(r"[^\d\.]", "", c.content)
+                        if re.match(r"^\d+(\.\d{1,2})?$", val) and float(val) > 1000:
+                            gross = c.content
+                            print(f"DEBUG: Extracted via Table: {gross}")
+                            break
                     if gross: break
             if gross: break
 
-    # Priority 2: Regex Hunt (If tables fail)
-    # Hunts for "Total taxable income ... 4721532.00" spanning newlines
+    # --- STRATEGY C: GENERIC REGEX (Last Resort) ---
     if not gross:
-        print("DEBUG: Trying Regex Fallback...")
-        regex_patterns = [
-            r"Total\s*taxable\s*income[\s\S]{1,150}?([\d,]+\.\d{2})",
-            r"Gross\s*Salary[\s\S]{1,150}?([\d,]+\.\d{2})",
-            r"Net\s*Salary[\s\S]{1,150}?([\d,]+\.\d{2})"
-        ]
-        for pat in regex_patterns:
-            match = re.search(pat, content, re.IGNORECASE)
-            if match:
-                gross = match.group(1)
-                print(f"DEBUG: Extracted Income via Regex: {gross}")
-                break
+        # Relaxed regex for standard Form 16s
+        regex_hunt = re.search(r"(?:Total\s*taxable\s*income|Gross\s*Salary)[\s\S]{1,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
+        if regex_hunt:
+            gross = regex_hunt.group(1)
+            print(f"DEBUG: Extracted via Generic Regex: {gross}")
 
     # 4. Tax Payable
     tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
@@ -197,17 +184,7 @@ def process_itrv(result: AnalyzeResult) -> IdentityResponse:
     income = re.search(r"Gross\s*Total\s*Income[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
     tax = re.search(r"(?:Total\s*Tax\s*Payable|Refund)\s*[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
     pan = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", content)
-    
-    return IdentityResponse(
-        document_type="ITR-V",
-        id_number=pan.group(0) if pan else None,
-        assessment_year=ay.group(1) if ay else None,
-        gross_income=income.group(1) if income else None,
-        tax_paid=tax.group(1) if tax else None,
-        confidence_score=0.9,
-        validation_status="VALID",
-        warnings=[]
-    )
+    return IdentityResponse(document_type="ITR-V", id_number=pan.group(0) if pan else None, assessment_year=ay.group(1) if ay else None, gross_income=income.group(1) if income else None, tax_paid=tax.group(1) if tax else None, confidence_score=0.9, validation_status="VALID", warnings=[])
 
 # --- ID PROCESSORS ---
 def process_aadhaar(result: AnalyzeResult) -> IdentityResponse:
@@ -222,18 +199,14 @@ def process_aadhaar(result: AnalyzeResult) -> IdentityResponse:
         if fields.get("Address") and not merged["address"]: merged["address"] = fields.get("Address").value
         if fields.get("DateOfBirth") and not merged["dob"]: merged["dob"] = str(fields.get("DateOfBirth").value)
         merged["conf"].append(doc.confidence)
-    
     if merged["name"]:
         refined = refine_name_using_anchor(result, merged["name"])
         merged["name"] = re.sub(r"(Name|Father's Name)[:\-\s]*", "", refined, flags=re.IGNORECASE).strip()
-
     if not merged["address"]:
         addr = extract_address_fallback(result.content)
         if addr: merged["address"] = addr
-
     warnings = []
     if merged["id"] and len(merged["id"].replace(" ","")) != 12: warnings.append("Invalid Aadhaar Length")
-    
     return IdentityResponse(document_type="AADHAAR", id_number=merged["id"], full_name=merged["name"], gender=extract_gender_fallback(result.content), date_of_birth=merged["dob"], address=merged["address"], confidence_score=0.8, validation_status="VALID" if not warnings else "REVIEW_NEEDED", warnings=warnings)
 
 def process_pan(result: AnalyzeResult) -> IdentityResponse:
@@ -243,7 +216,6 @@ def process_pan(result: AnalyzeResult) -> IdentityResponse:
     id_num = fields.get("DocumentNumber").value if fields.get("DocumentNumber") else None
     f = fields.get("FirstName").value if fields.get("FirstName") else ""
     l = fields.get("LastName").value if fields.get("LastName") else ""
-    
     return IdentityResponse(document_type="PAN_CARD", id_number=id_num, full_name=f"{f} {l}".strip(), gender=extract_gender_fallback(result.content), date_of_birth=str(fields.get("DateOfBirth").value) if fields.get("DateOfBirth") else None, confidence_score=doc.confidence, validation_status="VALID", warnings=[])
 
 def process_cheque(result: AnalyzeResult) -> IdentityResponse:
@@ -261,10 +233,10 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     
     client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
     
-    # REVERT: Use 'prebuilt-layout' for Forms because your JSON confirmed it works perfectly for Tables
+    # FORMS = prebuilt-layout (For Tables)
     model_id = "prebuilt-idDocument"
     if doc_type in [DocType.FORM16, DocType.ITRV, DocType.CHEQUE]:
-        model_id = "prebuilt-layout" # <--- REVERTED to use your proven JSON logic
+        model_id = "prebuilt-layout"
         
     print(f"DEBUG: Selected Model: {model_id} for DocType: {doc_type}")
     
