@@ -93,11 +93,12 @@ def extract_account_number(text: str) -> Optional[str]:
     return max(long_numbers, key=len) if long_numbers else None
 
 # --- INCOME PROCESSORS (V18 - UNIVERSAL WHITESPACE REGEX) ---
+# --- INCOME PROCESSORS (V19 - THE BULLDOZER & TABLE DUMPER) ---
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 V18 (Universal Regex)")
+    print("DEBUG: Using Form 16 V19 (Bulldozer Strategy)")
     content = result.content or ""
     
-    # 1. Employer Name (Proven Sandwich Logic)
+    # 1. Employer Name (Standard Logic - Working perfectly)
     employer = None
     lines = [line.content for page in result.pages for line in page.lines]
     for i, line in enumerate(lines):
@@ -122,41 +123,51 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     # 3. Income Extraction
     gross = None
     
-    # --- STRATEGY A: THE UNIVERSAL REGEX (Works on Layout AND ID Models) ---
-    # Matches "12." -> Any space/newline -> "Total taxable income" -> Any space/newline -> "(9-11)" -> Number
-    # We allow optional spaces inside (9-11) just in case: \(9\s*-\s*11\)
-    # \s+ matches NEWLINES and SPACES equally well.
-    universal_pattern = r"12\.\s+Total\s+taxable\s+income\s*\(9\s*-\s*11\)\s+(\d[\d,]*\.\d{2})"
+    # --- STRATEGY A: THE BULLDOZER REGEX ---
+    # We look for "Total taxable income" OR "Gross Salary"
+    # [\s\S]{1,200}? matches ANY character (newlines included) up to 200 chars non-greedily.
+    # This skips over "(9-11)", spaces, newlines, and any OCR noise.
+    bulldozer_pattern = r"(?:Total\s+taxable\s+income|Gross\s+Salary|Net\s+Salary)[\s\S]{1,200}?(\d[\d,]*\.\d{2})"
     
-    match = re.search(universal_pattern, content, re.IGNORECASE)
+    match = re.search(bulldozer_pattern, content, re.IGNORECASE)
     if match:
         gross = match.group(1)
-        print(f"DEBUG: Extracted via Universal Regex: {gross}")
+        print(f"DEBUG: Extracted via Bulldozer Regex: {gross}")
 
-    # --- STRATEGY B: TABLE LOOKUP (Best for Layout Model) ---
+    # --- STRATEGY B: TABLE LOOKUP (With Debugging) ---
     if not gross and result.tables:
-        target_row_keywords = ["Total taxable income", "Gross Salary", "Net Salary"]
-        for table in result.tables:
+        print(f"DEBUG: Scanning {len(result.tables)} tables for Income...")
+        target_row_keywords = ["Total taxable income", "Gross Salary", "Net Salary", "Total amount of salary"]
+        
+        for t_idx, table in enumerate(result.tables):
             for cell in table.cells:
                 cell_text = cell.content.replace("\n", " ").strip()
+                
+                # Check if this cell is a Header/Label
                 if any(k.lower() in cell_text.lower() for k in target_row_keywords):
+                    print(f"DEBUG: Table {t_idx} Found Keyword: '{cell_text}' in Row {cell.row_index}")
+                    
+                    # Get all cells in this row
                     row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
+                    
+                    # Log the row content to see what we are dealing with
+                    row_values = [c.content.replace('\n', ' ') for c in row_cells]
+                    print(f"DEBUG: Row Content: {row_values}")
+
+                    # Iterate backwards to find the amount
                     for c in reversed(row_cells):
-                        val = re.sub(r"[^\d\.]", "", c.content)
-                        if re.match(r"^\d+(\.\d{1,2})?$", val) and float(val) > 1000:
-                            gross = c.content
-                            print(f"DEBUG: Extracted via Table: {gross}")
-                            break
+                        val = re.sub(r"[^\d\.]", "", c.content) # Strip 'Rs.', commas
+                        
+                        # Match loose number format (e.g. 4721532 or 4721532.00)
+                        if re.match(r"^\d+(\.\d{1,2})?$", val):
+                            # Filter out small numbers like row indices "12" or "1"
+                            if float(val) > 1000: 
+                                gross = c.content
+                                print(f"DEBUG: Extracted via Table: {gross}")
+                                break
                     if gross: break
             if gross: break
-
-    # --- STRATEGY C: GENERIC FALLBACK (Last Resort) ---
-    if not gross:
-        regex_hunt = re.search(r"(?:Total\s*taxable\s*income|Gross\s*Salary)[\s\S]{1,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
-        if regex_hunt:
-            gross = regex_hunt.group(1)
-            print(f"DEBUG: Extracted via Generic Regex: {gross}")
 
     # 4. Tax Payable
     tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
