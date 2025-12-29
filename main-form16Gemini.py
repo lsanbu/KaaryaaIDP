@@ -12,12 +12,12 @@ import uvicorn
 
 # --- SETUP ---
 load_dotenv()
-app = FastAPI(title="Kaaryaa IDP - Intelligent Identity Engine")
+app = FastAPI(title="KDxAI - Intelligent Identity Engine")
 
 ENDPOINT = os.getenv("AZURE_DOC_INTEL_ENDPOINT")
 KEY = os.getenv("AZURE_DOC_INTEL_KEY")
 
-# --- DATA MODELS ---
+# --- DATA MODELS (FIXED) ---
 class DocType(str, Enum):
     AUTO = "auto"
     PAN = "pan"
@@ -28,10 +28,11 @@ class DocType(str, Enum):
 
 class IdentityResponse(BaseModel):
     document_type: str
+    # We add '= None' to all optional fields so Pydantic doesn't crash if we skip them
     id_number: str | None = None
     full_name: str | None = None
     gender: str | None = None
-    date_of_birth: str | None = None
+    date_of_birth: str | None = None  # <--- FIXED: Now defaults to None
     address: str | None = None
     
     # Banking Fields
@@ -92,65 +93,94 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME PROCESSORS (UPDATED FOR TABLE LOGIC) ---
-def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 Table Strategy (V13)")
+# --- INCOME HELPERS ---
+def process_itrv(result: AnalyzeResult) -> IdentityResponse:
+    print("DEBUG: Using ITR-V Strategy")
     content = result.content or ""
     
-    # 1. Employer Name (Line Iteration Strategy)
-    # Instead of regex, we find the "Header Line" and grab the "Next Line"
-    employer = None
-    lines = [line.content for page in result.pages for line in page.lines] # Flatten lines
-    for i, line in enumerate(lines):
-        # Look for the exact header from your document
-        if "Name and address of the Employer" in line or "Name and address of the Employer/Specified Bank" in line:
-            # The Name is usually on the next line
-            if i + 1 < len(lines):
-                employer = lines[i+1].strip()
-                # Check if the name spans two lines (e.g. "STANDARD CHARTERED" \n "GLOBAL BUSINESS...")
-                if i + 2 < len(lines):
-                    next_line = lines[i+2].strip()
-                    # Heuristic: If next line is ALL CAPS or looks like a continuation, add it
-                    if next_line.isupper() and "PRIVATE" in next_line or "LIMITED" in next_line:
-                        employer += " " + next_line
-            break
-
-    # 2. Assessment Year
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Gross Salary (Table Strategy)
-    gross = None
-    target_row_keywords = ["Total amount of salary received from current employer", "Gross Salary"]
+    income_match = re.search(r"Gross\s*Total\s*Income[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    income = income_match.group(1) if income_match else None
     
-    if result.tables:
-        for table in result.tables:
-            for cell in table.cells:
-                # Normalize cell content (remove newlines for easier matching)
-                cell_text = cell.content.replace("\n", " ").strip()
-                
-                # Check if this cell is our "Row Header"
-                if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    # Found the row! Now find the value in the same row.
-                    target_row_index = cell.row_index
-                    
-                    # Get all cells in this row
-                    row_cells = [c for c in table.cells if c.row_index == target_row_index]
-                    # Sort by column index to find the last one (usually the amount)
-                    row_cells.sort(key=lambda x: x.column_index)
-                    
-                    # Iterate backwards from the last cell to find a number
-                    for c in reversed(row_cells):
-                        # Clean currency string (remove chars, keep digits and dots)
-                        val = c.content.replace("Rs.", "").replace(",", "").strip()
-                        if re.match(r"^\d+(\.\d{2})?$", val):
-                            gross = c.content # Keep original formatting or clean it
-                            break
-                    if gross: break
-            if gross: break
+    tax_match = re.search(r"(?:Total\s*Tax\s*Payable|Refund)\s*[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
+    tax = tax_match.group(1) if tax_match else None
 
-    # 4. Tax Payable (Regex Fallback as it's often outside tables or clear enough)
-    tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
+    pan_match = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", content)
+    pan = pan_match.group(0) if pan_match else None
+    
+    name_match = re.search(r"Name[:\s]*([A-Z\s\.]+)", content)
+    name = name_match.group(1).strip() if name_match else None
+
+    warnings = []
+    if not income: warnings.append("Gross Income not found")
+    if not ay: warnings.append("Assessment Year not found")
+
+    return IdentityResponse(
+        document_type="ITR-V",
+        id_number=pan,
+        full_name=name,
+        assessment_year=ay,
+        gross_income=income,
+        tax_paid=tax,
+        confidence_score=0.9,
+        validation_status="VALID" if not warnings else "REVIEW_NEEDED",
+        warnings=warnings
+    )
+
+def process_form16(result: AnalyzeResult) -> IdentityResponse:
+    print("DEBUG: Using Form 16 Strategy V12")
+    content = result.content or ""
+    
+    # 1. Employer Name (Relaxed "Sandwich" Strategy)
+    # Made 'the' optional: Name and address of (the) Employer
+    # Made 'Specified Bank' optional
+    employer = None
+    # Look for start marker (Case Insensitive)
+    emp_start = re.search(r"Name\s*and\s*address\s*of\s*(?:the\s*)?Employer", content, re.IGNORECASE)
+    # Look for end marker (Case Insensitive)
+    emp_end = re.search(r"Name\s*and\s*address\s*of\s*(?:the\s*)?Employee", content, re.IGNORECASE)
+    
+    if emp_start and emp_end:
+        # Extract text between markers
+        raw_emp_text = content[emp_start.end():emp_end.start()]
+        # Filter out empty lines or small noise
+        lines = [line.strip() for line in raw_emp_text.split('\n') if len(line.strip()) > 3]
+        
+        # Heuristic: The Employer name is usually the first ALL CAPS or Title Case line
+        for line in lines:
+            # Skip lines that look like addresses (contain digits/pincodes) early on if possible, 
+            # but usually the Name is first.
+            employer = line
+            break # Take the first valid line
+            
+    # Fallback: Look for "TAN of Employer" and look backwards (Advanced) or use original fallback
+    if not employer:
+        # Try finding standard line
+        emp_match = re.search(r"Name\s*and\s*address\s*of\s*Employer[\s\S]*?\n([A-Za-z\s\.,&]+)", content, re.IGNORECASE)
+        employer = emp_match.group(1).strip() if emp_match else None
+
+    # 2. Assessment Year (Broad Search)
+    ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
+    ay = ay_match.group(1) if ay_match else None
+
+    # 3. Gross Salary (Robust Regex)
+    # Increased search window {0,300} chars to skip over "[1(d)-2(i)]" etc.
+    # Improved Number Regex: (\d[\d,]*\.\d{2}) -> Digit, followed by any digits/commas, ending in .00
+    salary_match = re.search(
+        r"Total\s*amount\s*of\s*salary\s*received\s*from\s*current\s*employer[\s\S]{0,300}?(\d[\d,]*\.\d{2})", 
+        content, 
+        re.IGNORECASE
+    )
+    gross = salary_match.group(1) if salary_match else None
+
+    # 4. Tax Payable (Robust Regex)
+    # Look for 'Net tax payable' OR 'Total Tax Payable'
+    # Scans up to 300 chars to find the number
+    tax_match = re.search(r"Net\s*tax\s*payable[\s\S]{0,300}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
+    if not tax_match:
+        tax_match = re.search(r"Total\s*Tax\s*Payable[\s\S]{0,300}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
     warnings = []
@@ -163,28 +193,9 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
         assessment_year=ay,
         gross_income=gross,
         tax_paid=tax,
-        confidence_score=0.9,
+        confidence_score=0.85,
         validation_status="VALID" if not warnings else "REVIEW_NEEDED",
         warnings=warnings
-    )
-
-def process_itrv(result: AnalyzeResult) -> IdentityResponse:
-    # Similar simple logic for ITR-V
-    content = result.content or ""
-    ay = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
-    income = re.search(r"Gross\s*Total\s*Income[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
-    tax = re.search(r"(?:Total\s*Tax\s*Payable|Refund)\s*[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
-    pan = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", content)
-    
-    return IdentityResponse(
-        document_type="ITR-V",
-        id_number=pan.group(0) if pan else None,
-        assessment_year=ay.group(1) if ay else None,
-        gross_income=income.group(1) if income else None,
-        tax_paid=tax.group(1) if tax else None,
-        confidence_score=0.9,
-        validation_status="VALID",
-        warnings=[]
     )
 
 # --- ID PROCESSORS ---
@@ -215,20 +226,39 @@ def process_aadhaar(result: AnalyzeResult) -> IdentityResponse:
     return IdentityResponse(document_type="AADHAAR", id_number=merged["id"], full_name=merged["name"], gender=extract_gender_fallback(result.content), date_of_birth=merged["dob"], address=merged["address"], confidence_score=0.8, validation_status="VALID" if not warnings else "REVIEW_NEEDED", warnings=warnings)
 
 def process_pan(result: AnalyzeResult) -> IdentityResponse:
-    if not result.documents: return IdentityResponse(document_type="UNKNOWN", confidence_score=0, validation_status="INVALID")
+    if not result.documents: return IdentityResponse(document_type="UNKNOWN", id_number=None, full_name=None, confidence_score=0, validation_status="INVALID")
     doc = result.documents[0]
     fields = doc.fields
     id_num = fields.get("DocumentNumber").value if fields.get("DocumentNumber") else None
     f = fields.get("FirstName").value if fields.get("FirstName") else ""
     l = fields.get("LastName").value if fields.get("LastName") else ""
     
-    return IdentityResponse(document_type="PAN_CARD", id_number=id_num, full_name=f"{f} {l}".strip(), gender=extract_gender_fallback(result.content), date_of_birth=str(fields.get("DateOfBirth").value) if fields.get("DateOfBirth") else None, confidence_score=doc.confidence, validation_status="VALID", warnings=[])
+    warnings = []
+    if not id_num: warnings.append("PAN Missing")
+    
+    return IdentityResponse(document_type="PAN_CARD", id_number=id_num, full_name=f"{f} {l}".strip(), gender=extract_gender_fallback(result.content), date_of_birth=str(fields.get("DateOfBirth").value) if fields.get("DateOfBirth") else None, confidence_score=doc.confidence, validation_status="VALID" if not warnings else "INVALID", warnings=warnings)
 
 def process_cheque(result: AnalyzeResult) -> IdentityResponse:
     content = result.content
     ifsc = extract_ifsc(content)
     acc = extract_account_number(content)
-    return IdentityResponse(document_type="CHEQUE", id_number=acc, ifsc_code=ifsc, confidence_score=0.85, validation_status="VALID", warnings=[])
+    warnings = []
+    if not ifsc: warnings.append("IFSC Missing")
+    if not acc: warnings.append("Account Number Missing")
+    
+    return IdentityResponse(document_type="CHEQUE", id_number=acc, full_name=None, ifsc_code=ifsc, micr_code=None, bank_name="Unknown Bank", confidence_score=0.85, validation_status="VALID" if not warnings else "REVIEW_NEEDED", warnings=warnings)
+
+# --- CLASSIFIER ---
+def classify_document(result: AnalyzeResult) -> DocType:
+    content = (result.content or "").upper()
+    
+    if "FORM 16" in content or "FORM NO. 16" in content: return DocType.FORM16
+    if "ITR-V" in content or "INDIAN INCOME TAX RETURN" in content: return DocType.ITRV
+    if "PAY " in content and "RUPEES" in content and re.search(r"[A-Z]{4}0[A-Z0-9]{6}", content): return DocType.CHEQUE
+    if "INCOME TAX DEPARTMENT" in content: return DocType.PAN
+    if "UNIQUE IDENTIFICATION" in content or "AADHAAR" in content: return DocType.AADHAAR
+    
+    return DocType.PAN 
 
 # --- ROUTER ---
 @app.post("/extract/identity", response_model=IdentityResponse)
@@ -238,29 +268,11 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     content = await file.read()
     
     client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
-    
-    # SMART SWITCH: Choose the right model based on document type
-    # IDs need "prebuilt-idDocument" (for semantic fields)
-    # Forms need "prebuilt-layout" (for Tables)
-    model_id = "prebuilt-idDocument"
-    if doc_type in [DocType.FORM16, DocType.ITRV, DocType.CHEQUE]:
-        model_id = "prebuilt-layout"
-        
-    print(f"DEBUG: Selected Model: {model_id} for DocType: {doc_type}")
-    
-    poller = client.begin_analyze_document(model_id, document=content)
+    poller = client.begin_analyze_document("prebuilt-idDocument", document=content)
     result = poller.result()
     
-    # Classification Logic (if AUTO)
     strategy = doc_type
-    if strategy == DocType.AUTO:
-        content_upper = (result.content or "").upper()
-        if "FORM 16" in content_upper: strategy = DocType.FORM16
-        elif "ITR-V" in content_upper: strategy = DocType.ITRV
-        elif "PAY " in content_upper and "RUPEES" in content_upper: strategy = DocType.CHEQUE
-        elif "INCOME TAX DEPARTMENT" in content_upper: strategy = DocType.PAN
-        else: strategy = DocType.AADHAAR
-    
+    if strategy == DocType.AUTO: strategy = classify_document(result)
     print(f"DEBUG: Classified as {strategy}")
 
     if strategy == DocType.AADHAAR: return process_aadhaar(result)
