@@ -97,7 +97,7 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     print("DEBUG: Using Form 16 V18 (Universal Regex)")
     content = result.content or ""
     
-    # 1. Employer Name
+    # 1. Employer Name (Proven Sandwich Logic)
     employer = None
     lines = [line.content for page in result.pages for line in page.lines]
     for i, line in enumerate(lines):
@@ -125,6 +125,7 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     # --- STRATEGY A: THE UNIVERSAL REGEX (Works on Layout AND ID Models) ---
     # Matches "12." -> Any space/newline -> "Total taxable income" -> Any space/newline -> "(9-11)" -> Number
     # We allow optional spaces inside (9-11) just in case: \(9\s*-\s*11\)
+    # \s+ matches NEWLINES and SPACES equally well.
     universal_pattern = r"12\.\s+Total\s+taxable\s+income\s*\(9\s*-\s*11\)\s+(\d[\d,]*\.\d{2})"
     
     match = re.search(universal_pattern, content, re.IGNORECASE)
@@ -139,13 +140,10 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
             for cell in table.cells:
                 cell_text = cell.content.replace("\n", " ").strip()
                 if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    # Get all cells in this row
                     row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
-                    # Iterate backwards to find the number
                     for c in reversed(row_cells):
                         val = re.sub(r"[^\d\.]", "", c.content)
-                        # Look for a number > 1000 to avoid row numbers
                         if re.match(r"^\d+(\.\d{1,2})?$", val) and float(val) > 1000:
                             gross = c.content
                             print(f"DEBUG: Extracted via Table: {gross}")
@@ -155,8 +153,7 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
 
     # --- STRATEGY C: GENERIC FALLBACK (Last Resort) ---
     if not gross:
-        # Fallback for standard forms: Look for "Total taxable income" followed closely by a big number
-        regex_hunt = re.search(r"(?:Total\s*taxable\s*income|Gross\s*Salary)[\s\S]{1,150}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
+        regex_hunt = re.search(r"(?:Total\s*taxable\s*income|Gross\s*Salary)[\s\S]{1,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
         if regex_hunt:
             gross = regex_hunt.group(1)
             print(f"DEBUG: Extracted via Generic Regex: {gross}")
