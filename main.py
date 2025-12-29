@@ -92,64 +92,95 @@ def extract_account_number(text: str) -> Optional[str]:
     long_numbers = re.findall(r"(?<!\d)\d{10,18}(?!\d)", text)
     return max(long_numbers, key=len) if long_numbers else None
 
-# --- INCOME PROCESSORS (UPDATED FOR TABLE LOGIC) ---
+# --- INCOME PROCESSORS (V14 - SMART SKIP & DUAL MODE) ---
 def process_form16(result: AnalyzeResult) -> IdentityResponse:
-    print("DEBUG: Using Form 16 Table Strategy (V13)")
+    print("DEBUG: Using Form 16 V14 Strategy")
     content = result.content or ""
     
-    # 1. Employer Name (Line Iteration Strategy)
-    # Instead of regex, we find the "Header Line" and grab the "Next Line"
+    # 1. Employer Name (Smart Line Iterator)
     employer = None
-    lines = [line.content for page in result.pages for line in page.lines] # Flatten lines
+    lines = [line.content for page in result.pages for line in page.lines]
+    
     for i, line in enumerate(lines):
-        # Look for the exact header from your document
+        # Find the Employer Header
         if "Name and address of the Employer" in line or "Name and address of the Employer/Specified Bank" in line:
-            # The Name is usually on the next line
-            if i + 1 < len(lines):
-                employer = lines[i+1].strip()
-                # Check if the name spans two lines (e.g. "STANDARD CHARTERED" \n "GLOBAL BUSINESS...")
-                if i + 2 < len(lines):
-                    next_line = lines[i+2].strip()
-                    # Heuristic: If next line is ALL CAPS or looks like a continuation, add it
-                    if next_line.isupper() and "PRIVATE" in next_line or "LIMITED" in next_line:
-                        employer += " " + next_line
+            print(f"DEBUG: Found Employer Header at line {i}: {line}")
+            
+            # Look ahead up to 3 lines to find the actual name
+            # This skips "Name and address of Employee..." if it appears immediately after
+            for offset in range(1, 4):
+                if i + offset >= len(lines): break
+                candidate = lines[i+offset].strip()
+                
+                # SKIP LOGIC: If candidate is another header, ignore it
+                if "Name and address" in candidate or "Employee" in candidate or "Specified senior" in candidate:
+                    print(f"DEBUG: Skipping header-like line: {candidate}")
+                    continue
+                
+                # Found it!
+                employer = candidate
+                print(f"DEBUG: Selected Employer: {employer}")
+                
+                # Check next line for continuation (e.g. "GLOBAL BUSINESS SERVICES")
+                if i + offset + 1 < len(lines):
+                    next_l = lines[i+offset+1].strip()
+                    if next_l.isupper() and ("PRIVATE" in next_l or "LIMITED" in next_l or "SERVICES" in next_l):
+                        employer += " " + next_l
+                break
             break
 
     # 2. Assessment Year
     ay_match = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     ay = ay_match.group(1) if ay_match else None
 
-    # 3. Gross Salary (Table Strategy)
+    # 3. Gross Salary - STRATEGY A: TABLE LOOKUP
     gross = None
-    target_row_keywords = ["Total amount of salary received from current employer", "Gross Salary"]
+    # Keywords to find the right row in the table
+    target_row_keywords = [
+        "Total amount of salary received from current employer", 
+        "Gross Salary", 
+        "Salary as per provisions contained in section 17(1)"
+    ]
     
     if result.tables:
+        print(f"DEBUG: Scanning {len(result.tables)} tables for Gross Salary...")
         for table in result.tables:
             for cell in table.cells:
-                # Normalize cell content (remove newlines for easier matching)
                 cell_text = cell.content.replace("\n", " ").strip()
                 
-                # Check if this cell is our "Row Header"
                 if any(k.lower() in cell_text.lower() for k in target_row_keywords):
-                    # Found the row! Now find the value in the same row.
-                    target_row_index = cell.row_index
-                    
+                    print(f"DEBUG: Found Salary Row Keyword: '{cell_text}'")
                     # Get all cells in this row
-                    row_cells = [c for c in table.cells if c.row_index == target_row_index]
-                    # Sort by column index to find the last one (usually the amount)
+                    row_cells = [c for c in table.cells if c.row_index == cell.row_index]
                     row_cells.sort(key=lambda x: x.column_index)
                     
-                    # Iterate backwards from the last cell to find a number
+                    # Iterate backwards to find the number (usually last column)
                     for c in reversed(row_cells):
-                        # Clean currency string (remove chars, keep digits and dots)
                         val = c.content.replace("Rs.", "").replace(",", "").strip()
-                        if re.match(r"^\d+(\.\d{2})?$", val):
-                            gross = c.content # Keep original formatting or clean it
+                        # Match 12345.00 or 12345
+                        if re.match(r"^\d+(\.\d{2})?$", val) and float(val) > 1000: # Filter small row numbers
+                            gross = c.content
+                            print(f"DEBUG: Extracted Gross via Table: {gross}")
                             break
                     if gross: break
             if gross: break
 
-    # 4. Tax Payable (Regex Fallback as it's often outside tables or clear enough)
+    # 3. Gross Salary - STRATEGY B: REGEX FALLBACK (If Table failed)
+    if not gross:
+        print("DEBUG: Table extraction failed. Trying Regex Fallback...")
+        # Look for the specific pattern in Part B: "Total... [1(d)-2(i)] ... 4771532.00"
+        # We look for a large number following "Total amount of salary"
+        # [\s\S]{1,100} allows for newlines and noise like "[1(d)-2(i)]"
+        regex_hunt = re.search(
+            r"Total\s+amount\s+of\s+salary\s+received[\s\S]{1,150}?(\d[\d,]*\.\d{2})", 
+            content, 
+            re.IGNORECASE
+        )
+        if regex_hunt:
+            gross = regex_hunt.group(1)
+            print(f"DEBUG: Extracted Gross via Regex: {gross}")
+
+    # 4. Tax Payable
     tax_match = re.search(r"(?:Net\s*tax\s*payable|Total\s*Tax\s*Payable)[\s\S]{0,100}?(\d[\d,]*\.\d{2})", content, re.IGNORECASE)
     tax = tax_match.group(1) if tax_match else None
     
@@ -169,7 +200,6 @@ def process_form16(result: AnalyzeResult) -> IdentityResponse:
     )
 
 def process_itrv(result: AnalyzeResult) -> IdentityResponse:
-    # Similar simple logic for ITR-V
     content = result.content or ""
     ay = re.search(r"Assessment\s*Year\s*[:\-]?\s*(\d{4}-\d{2})", content, re.IGNORECASE)
     income = re.search(r"Gross\s*Total\s*Income[\s\S]*?(\d{1,3}(?:,\d{2,3})*)", content, re.IGNORECASE)
@@ -239,9 +269,7 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     
     client = DocumentAnalysisClient(ENDPOINT, AzureKeyCredential(KEY))
     
-    # SMART SWITCH: Choose the right model based on document type
-    # IDs need "prebuilt-idDocument" (for semantic fields)
-    # Forms need "prebuilt-layout" (for Tables)
+    # SMART SWITCH: Choose model
     model_id = "prebuilt-idDocument"
     if doc_type in [DocType.FORM16, DocType.ITRV, DocType.CHEQUE]:
         model_id = "prebuilt-layout"
@@ -251,7 +279,6 @@ async def extract_identity(file: UploadFile = File(...), doc_type: DocType = For
     poller = client.begin_analyze_document(model_id, document=content)
     result = poller.result()
     
-    # Classification Logic (if AUTO)
     strategy = doc_type
     if strategy == DocType.AUTO:
         content_upper = (result.content or "").upper()
